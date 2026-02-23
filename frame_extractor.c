@@ -13,12 +13,21 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <semaphore.h>
+#include <math.h>
+#include <dirent.h>
 
 #ifdef _WIN32
 #include <windows.h>
+#include <direct.h>
+#define PATH_SEP '\\'
+#define PATH_SEP_STR "\\"
+#define MKDIR(p) _mkdir(p)
 #else
 #include <sys/time.h>
 #include <sys/wait.h>
+#define PATH_SEP '/'
+#define PATH_SEP_STR "/"
+#define MKDIR(p) mkdir(p, 0777)
 #endif
 
 // ==================== TIMING ====================
@@ -171,7 +180,7 @@ typedef struct {
     int height;
     int format;
     int fast_mode;
-    char output_pattern[256];
+    char output_pattern[512];
     
     int head;
     int tail;
@@ -234,17 +243,14 @@ void save_yuv_frame(AVFrame* frame, const char* filename, int width, int height)
     FILE *fp = fopen(filename, "wb");
     if (!fp) return;
     
-    // Write Y plane
     for (int y = 0; y < height; y++) {
         fwrite(frame->data[0] + y * frame->linesize[0], 1, width, fp);
     }
     
-    // Write U plane (half size for 4:2:0)
     for (int y = 0; y < height/2; y++) {
         fwrite(frame->data[1] + y * frame->linesize[1], 1, width/2, fp);
     }
     
-    // Write V plane (half size for 4:2:0)
     for (int y = 0; y < height/2; y++) {
         fwrite(frame->data[2] + y * frame->linesize[2], 1, width/2, fp);
     }
@@ -393,18 +399,23 @@ typedef struct {
     int extract_audio;
     int audio_only;
     int audio_format;
-    int audio_bitrate;        // NEW: bitrate for audio (kbps)
+    int audio_bitrate;
     int use_time;
     int use_time_range;
     char time_str[64];
     char start_time[64];
     char end_time[64];
+    char ytdl_url[1024];      // New: YouTube URL
+    char ytdl_format[64];      // New: yt-dlp format
+    int ytdl_download;         // New: flag for yt-dlp
 } Config;
 
 void print_usage() {
-    printf("\n🎬 === Frame Extractor v8.0 (MULTI-THREADED + BITRATE) ===\n");
-    printf("Extract frames with %d threads + FFmpeg audio with custom bitrate!\n\n", NUM_SAVER_THREADS);
-    printf("Usage: frame_extractor -input <video> [options]\n\n");
+    printf("\n🎬 === Frame Extractor v10.0 (YOUTUBE EDITION) ===\n");
+    printf("Extract frames/audio from local videos OR YouTube URLs!\n\n");
+    printf("Usage: frame_extractor -input <video> [options]\n");
+    printf("   OR: frame_extractor -ytdl <url> [options]\n\n");
+    
     printf("📹 FRAME OPTIONS:\n");
     printf("  -output <pattern>     Output filename pattern (e.g., frame_%%03d.png)\n");
     printf("  -frame <n>            Extract single frame\n");
@@ -415,24 +426,25 @@ void print_usage() {
     printf("  -time-range <start> <end>  Extract frames between times\n");
     printf("  -fast                  FAST MODE: save raw YUV\n\n");
     
-    printf("🎵 AUDIO OPTIONS (USES FFMPEG!):\n");
+    printf("🎵 AUDIO OPTIONS:\n");
     printf("  -extract-audio        Extract audio along with frames\n");
-    printf("  -audio-only           Extract audio only (no frames)\n");
+    printf("  -audio-only           Extract audio only\n");
     printf("  -output-audio <file>  Audio output filename\n");
     printf("  -audio-format <fmt>   mp3, aac, wav, ogg (default: mp3)\n");
-    printf("  -audio-bitrate <kbps> Bitrate for audio (e.g., 128, 192, 320) (default: 128)\n\n");
+    printf("  -audio-bitrate <kbps> Bitrate for audio (32-320, default: 128)\n\n");
     
-    printf("🎚️  BITRATE EXAMPLES:\n");
-    printf("  # Low quality (64 kbps) - smaller file\n");
-    printf("  frame_extractor -input video.mp4 -audio-only -audio-bitrate 64 -output-audio small.mp3\n\n");
-    printf("  # High quality (320 kbps) - best sound\n");
-    printf("  frame_extractor -input video.mp4 -audio-only -audio-bitrate 320 -output-audio best.mp3\n\n");
+    printf("🌐 YOUTUBE OPTIONS (NEW!):\n");
+    printf("  -ytdl <url>           Download from YouTube first\n");
+    printf("  -ytdl-format <fmt>    yt-dlp format (default: auto)\n");
+    printf("                         auto = best for your needs\n\n");
     
-    printf("🚀 FULL EXAMPLES:\n");
-    printf("  # Extract frames with %d threads + 320kbps audio:\n", NUM_SAVER_THREADS);
-    printf("  frame_extractor -input video.mp4 -time-range 00:02 00:03 \\\n");
-    printf("                  -output frame_%%03d.png -extract-audio \\\n");
-    printf("                  -output-audio clip.mp3 -audio-bitrate 320\n");
+    printf("🚀 YOUTUBE EXAMPLES:\n");
+    printf("  # Download and extract audio\n");
+    printf("  frame_extractor -ytdl \"https://youtu.be/...\" -audio-only -output-audio song.mp3\n\n");
+    printf("  # Download and extract frame at 1:30\n");
+    printf("  frame_extractor -ytdl \"https://youtu.be/...\" -time 00:01:30 -output thumbnail.png\n\n");
+    printf("  # Download best video, extract frames 100-200\n");
+    printf("  frame_extractor -ytdl \"https://youtu.be/...\" -range 100 200 -output frames/%%03d.png\n");
 }
 
 int parse_frames_string(const char* str, int* frames, int* count) {
@@ -492,7 +504,113 @@ int frame_in_list(int frame, int* list, int count) {
     return 0;
 }
 
-// ==================== FFMPEG AUDIO EXTRACTION WITH BITRATE ====================
+// ==================== PATH FIXING FOR WINDOWS ====================
+
+void fix_windows_path(char* path) {
+    for (int i = 0; path[i]; i++) {
+        if (path[i] == '\\') {
+            path[i] = '/';
+        }
+    }
+}
+
+// ==================== YT-DLP DOWNLOAD FUNCTION ====================
+
+int download_from_youtube(Config* config) {
+    printf("\n🌐 === YOUTUBE DOWNLOAD ===\n");
+    
+    // Check if yt-dlp is installed
+    if (system("yt-dlp --version > /dev/null 2>&1") != 0) {
+        printf("❌ yt-dlp not found! Install with: pip install yt-dlp\n");
+        return 0;
+    }
+    
+    // Smart format selection
+    const char* format;
+    if (config->audio_only) {
+        format = "bestaudio";
+        printf("🎵 Audio-only mode: downloading best audio\n");
+    }
+    else if (config->frame_count > 0 || config->use_time_range || config->start_frame > 0) {
+        format = "bestvideo[ext=mp4]";
+        printf("📹 Frame extraction: downloading best video\n");
+    }
+    else if (config->extract_audio) {
+        format = "bestvideo+bestaudio";
+        printf("🎬 Video+Audio: downloading both\n");
+    }
+    else {
+        format = "best[ext=mp4]";
+        printf("📥 Default: downloading best MP4\n");
+    }
+    
+    // Use custom format if specified
+    if (config->ytdl_format[0] != '\0') {
+        format = config->ytdl_format;
+        printf("📥 Using custom format: %s\n", format);
+    }
+    
+    // Build download command
+    char cmd[4096];
+    snprintf(cmd, sizeof(cmd),
+             "yt-dlp -f '%s' --newline --progress -o 'ytdl_%%(title)s.%%(ext)s' '%s'",
+             format, config->ytdl_url);
+    
+    printf("\n🔄 Downloading...\n");
+    fflush(stdout);
+    
+    // Run download and show progress
+    FILE* fp = popen(cmd, "r");
+    if (!fp) {
+        printf("❌ Failed to run yt-dlp\n");
+        return 0;
+    }
+    
+    char line[512];
+    while (fgets(line, sizeof(line), fp) != NULL) {
+        if (strstr(line, "[download]") && strstr(line, "%")) {
+            // Extract percentage
+            char* percent_str = strstr(line, " ");
+            if (percent_str) {
+                percent_str++;
+                char* end = strchr(percent_str, '%');
+                if (end) *end = '\0';
+                printf("\r   ⬇️  Downloaded: %s%%", percent_str);
+                fflush(stdout);
+            }
+        }
+    }
+    
+    int status = pclose(fp);
+    if (status != 0) {
+        printf("\n❌ Download failed!\n");
+        return 0;
+    }
+    
+    printf("\r   ⬇️  Download complete!          \n");
+    
+    // Find the downloaded file
+    FILE* ls_fp = popen("ls ytdl_* 2>/dev/null | head -1", "r");
+    if (!ls_fp) {
+        printf("❌ Cannot find downloaded file\n");
+        return 0;
+    }
+    
+    if (fgets(config->input, sizeof(config->input), ls_fp) == NULL) {
+        printf("❌ No downloaded file found\n");
+        pclose(ls_fp);
+        return 0;
+    }
+    
+    // Remove newline
+    config->input[strcspn(config->input, "\n")] = '\0';
+    pclose(ls_fp);
+    
+    printf("📂 Downloaded: %s\n", config->input);
+    return 1;
+}
+
+// ==================== FFMPEG AUDIO EXTRACTION ====================
 
 const char* get_audio_codec(int format) {
     switch(format) {
@@ -516,24 +634,8 @@ const char* get_audio_extension(int format) {
 
 const char* get_bitrate_option(int format, int bitrate) {
     static char option[64];
-    
-    if (bitrate <= 0) bitrate = 128;  // Default
-    
-    switch(format) {
-        case 0:  // MP3
-            snprintf(option, sizeof(option), "-b:a %dk", bitrate);
-            break;
-        case 1:  // AAC
-            snprintf(option, sizeof(option), "-b:a %dk", bitrate);
-            break;
-        case 2:  // WAV (uncompressed, bitrate ignored)
-            return "";
-        case 3:  // OGG Vorbis
-            snprintf(option, sizeof(option), "-b:a %dk", bitrate);
-            break;
-        default:
-            return "";
-    }
+    if (bitrate <= 0) bitrate = 128;
+    snprintf(option, sizeof(option), "-b:a %dk", bitrate);
     return option;
 }
 
@@ -542,6 +644,7 @@ void* extract_audio_thread(void* arg) {
     
     printf("\n🎵 === AUDIO EXTRACTION (FFmpeg) ===\n");
     
+    // Check if ffmpeg is installed
     if (system("ffmpeg -version > /dev/null 2>&1") != 0) {
         printf("❌ FFmpeg not found! Install with: pkg install ffmpeg\n");
         return NULL;
@@ -553,64 +656,53 @@ void* extract_audio_thread(void* arg) {
     
     char final_output[512];
     strcpy(final_output, config->audio_output);
+    
     if (strstr(final_output, ".") == NULL) {
-        snprintf(final_output, sizeof(final_output), "%s.%s", config->audio_output, ext);
+        char temp[512];
+        snprintf(temp, sizeof(temp), "%s.%s", config->audio_output, ext);
+        strcpy(final_output, temp);
     }
     
-    printf("📂 Input: %s\n", config->input);
+    char fixed_input[512];
+    strcpy(fixed_input, config->input);
+    fix_windows_path(fixed_input);
+    fix_windows_path(final_output);
+    
+    printf("📂 Input: %s\n", fixed_input);
     printf("📂 Output: %s\n", final_output);
     printf("🎵 Format: %s (%s)\n", ext, codec);
-    if (config->audio_bitrate > 0) {
-        printf("🎚️  Bitrate: %d kbps\n", config->audio_bitrate);
-    }
+    if (config->audio_bitrate > 0) printf("🎚️ Bitrate: %d kbps\n", config->audio_bitrate);
     
     char time_option[256] = "";
     if (config->use_time_range) {
         double start_seconds = 0, end_seconds = 0;
         int h, m, s;
         
-        if (sscanf(config->start_time, "%d:%d:%d", &h, &m, &s) == 3) {
-            start_seconds = h * 3600 + m * 60 + s;
-        } else if (sscanf(config->start_time, "%d:%d", &m, &s) == 2) {
-            start_seconds = m * 60 + s;
-        } else {
-            start_seconds = atof(config->start_time);
-        }
+        if (sscanf(config->start_time, "%d:%d:%d", &h, &m, &s) == 3) start_seconds = h * 3600 + m * 60 + s;
+        else if (sscanf(config->start_time, "%d:%d", &m, &s) == 2) start_seconds = m * 60 + s;
+        else start_seconds = atof(config->start_time);
         
-        if (sscanf(config->end_time, "%d:%d:%d", &h, &m, &s) == 3) {
-            end_seconds = h * 3600 + m * 60 + s;
-        } else if (sscanf(config->end_time, "%d:%d", &m, &s) == 2) {
-            end_seconds = m * 60 + s;
-        } else {
-            end_seconds = atof(config->end_time);
-        }
+        if (sscanf(config->end_time, "%d:%d:%d", &h, &m, &s) == 3) end_seconds = h * 3600 + m * 60 + s;
+        else if (sscanf(config->end_time, "%d:%d", &m, &s) == 2) end_seconds = m * 60 + s;
+        else end_seconds = atof(config->end_time);
         
         double duration = end_seconds - start_seconds;
         if (duration > 0) {
-            snprintf(time_option, sizeof(time_option), 
-                     "-ss %.3f -t %.3f", start_seconds, duration);
-            printf("⏱️ Time range: %.2fs to %.2fs (duration: %.2fs)\n", 
-                   start_seconds, end_seconds, duration);
+            snprintf(time_option, sizeof(time_option), "-ss %.3f -t %.3f", start_seconds, duration);
+            printf("⏱️ Time range: %.2fs to %.2fs\n", start_seconds, end_seconds);
         }
-    } else if (config->use_time) {
-        double seconds = atof(config->time_str);
-        snprintf(time_option, sizeof(time_option), "-ss %.3f -t 0.04", seconds);
-        printf("⏱️ Time: %.2fs\n", seconds);
     }
     
-    char command[4096];
+    char command[8192];
     snprintf(command, sizeof(command),
              "ffmpeg -i \"%s\" %s -vn %s -acodec %s -y \"%s\" 2>&1",
-             config->input, time_option, bitrate_opt, codec, final_output);
+             fixed_input, time_option, bitrate_opt, codec, final_output);
     
     printf("\n🔄 Running FFmpeg...\n");
     fflush(stdout);
     
     FILE* fp = popen(command, "r");
-    if (!fp) {
-        printf("❌ Failed to run FFmpeg\n");
-        return NULL;
-    }
+    if (!fp) { printf("❌ Failed to run FFmpeg\n"); return NULL; }
     
     char line[256];
     while (fgets(line, sizeof(line), fp) != NULL) {
@@ -620,29 +712,328 @@ void* extract_audio_thread(void* arg) {
                 time_str += 5;
                 char* end = strchr(time_str, ' ');
                 if (end) *end = '\0';
-                printf("\r   ⏱️  %s", time_str);
-                fflush(stdout);
-            }
-            
-            char* size_str = strstr(line, "size=");
-            if (size_str && strstr(line, "kB")) {
-                size_str += 5;
-                char* end = strchr(size_str, 'k');
-                if (end) *end = '\0';
-                printf(" | 📦 %s KB", size_str);
+                printf("\r   ⏱️ %s", time_str);
                 fflush(stdout);
             }
         }
     }
     
     int status = pclose(fp);
+    if (status == 0) printf("\n\n✅ Audio extraction complete!\n");
+    else printf("\n\n❌ FFmpeg failed with code %d\n", status);
     
-    if (status == 0) {
-        printf("\n\n✅ Audio extraction complete!\n");
+    return NULL;
+}
+
+// ==================== MAIN ====================
+
+int main(int argc, char** argv) {
+    // Silence FFmpeg warnings
+    av_log_set_level(AV_LOG_QUIET);
+    
+    Config config;
+    memset(&config, 0, sizeof(Config));
+    strcpy(config.output_pattern, "frame_%d.png");
+    strcpy(config.audio_output, "audio");
+    config.step = 1;
+    config.format = 0;
+    config.fast_mode = 0;
+    config.extract_audio = 0;
+    config.audio_only = 0;
+    config.audio_format = 0;
+    config.audio_bitrate = 128;
+    config.ytdl_download = 0;
+    
+    printf("\n🎬 Frame Extractor v10.0 (YOUTUBE EDITION)\n");
+    printf("==========================================\n");
+    
+    // Parse command line
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-input") == 0 && i + 1 < argc) {
+            strcpy(config.input, argv[++i]);
+        } else if (strcmp(argv[i], "-output") == 0 && i + 1 < argc) {
+            strcpy(config.output_pattern, argv[++i]);
+        } else if (strcmp(argv[i], "-output-audio") == 0 && i + 1 < argc) {
+            strcpy(config.audio_output, argv[++i]);
+        } else if (strcmp(argv[i], "-audio-format") == 0 && i + 1 < argc) {
+            if (strcmp(argv[i+1], "mp3") == 0) config.audio_format = 0;
+            else if (strcmp(argv[i+1], "aac") == 0) config.audio_format = 1;
+            else if (strcmp(argv[i+1], "wav") == 0) config.audio_format = 2;
+            else if (strcmp(argv[i+1], "ogg") == 0) config.audio_format = 3;
+            i++;
+        } else if (strcmp(argv[i], "-audio-bitrate") == 0 && i + 1 < argc) {
+            config.audio_bitrate = atoi(argv[++i]);
+            if (config.audio_bitrate < 32) config.audio_bitrate = 32;
+            if (config.audio_bitrate > 320) config.audio_bitrate = 320;
+        } else if (strcmp(argv[i], "-frame") == 0 && i + 1 < argc) {
+            config.frames[0] = atoi(argv[++i]);
+            config.frame_count = 1;
+        } else if (strcmp(argv[i], "-frames") == 0 && i + 1 < argc) {
+            parse_frames_string(argv[++i], config.frames, &config.frame_count);
+        } else if (strcmp(argv[i], "-range") == 0 && i + 2 < argc) {
+            config.start_frame = atoi(argv[++i]);
+            config.end_frame = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-step") == 0 && i + 1 < argc) {
+            config.step = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-time") == 0 && i + 1 < argc) {
+            strcpy(config.time_str, argv[++i]);
+            config.use_time = 1;
+        } else if (strcmp(argv[i], "-time-range") == 0 && i + 2 < argc) {
+            strcpy(config.start_time, argv[++i]);
+            strcpy(config.end_time, argv[++i]);
+            config.use_time_range = 1;
+        } else if (strcmp(argv[i], "-fast") == 0) {
+            config.fast_mode = 1;
+        } else if (strcmp(argv[i], "-extract-audio") == 0) {
+            config.extract_audio = 1;
+        } else if (strcmp(argv[i], "-audio-only") == 0) {
+            config.audio_only = 1;
+        } else if (strcmp(argv[i], "-ytdl") == 0 && i + 1 < argc) {
+            strcpy(config.ytdl_url, argv[++i]);
+            config.ytdl_download = 1;
+        } else if (strcmp(argv[i], "-ytdl-format") == 0 && i + 1 < argc) {
+            strcpy(config.ytdl_format, argv[++i]);
+        } else if (strcmp(argv[i], "-help") == 0 || strcmp(argv[i], "--help") == 0) {
+            print_usage();
+            return 0;
+        }
+    }
+    
+    // ===== YOUTUBE DOWNLOAD =====
+    if (config.ytdl_download) {
+        if (!download_from_youtube(&config)) {
+            return 1;
+        }
+    }
+    
+    // Check if we have an input file
+    if (config.input[0] == '\0') {
+        print_usage();
+        return 1;
+    }
+    
+    fix_windows_path(config.input);
+    
+    // ===== AUDIO-ONLY MODE =====
+    if (config.audio_only) {
+        extract_audio_thread(&config);
+        return 0;
+    }
+    
+    // ===== FRAME EXTRACTION =====
+    
+    avformat_network_init();
+    AVFormatContext* fmt_ctx = avformat_alloc_context();
+    
+    printf("📂 Opening: %s\n", config.input);
+    if (avformat_open_input(&fmt_ctx, config.input, NULL, NULL) != 0) {
+        printf("❌ Error: Cannot open file!\n");
+        return 1;
+    }
+    
+    avformat_find_stream_info(fmt_ctx, NULL);
+    
+    int video_stream_idx = -1;
+    
+    printf("\n🔍 Scanning streams:\n");
+    for (int i = 0; i < fmt_ctx->nb_streams; i++) {
+        AVStream* stream = fmt_ctx->streams[i];
+        const char* type = "unknown";
         
-        char info[512];
-        snprintf(info, sizeof(info), "ls -lh \"%s\"", final_output);
-        system(info);
+        if (stream->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            type = "VIDEO";
+            video_stream_idx = i;
+        } else if (stream->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
+            type = "AUDIO";
+        }
         
-        if (config->audio_bitrate > 0) {
-            printf("🎚️  Bitrate used: %d kbps\n", 
+        printf("   Stream %d: %s\n", i, type);
+    }
+    
+    if (video_stream_idx == -1) {
+        printf("❌ No video stream found!\n");
+        return 1;
+    }
+    
+    AVStream* video_stream = fmt_ctx->streams[video_stream_idx];
+    double fps = av_q2d(video_stream->avg_frame_rate);
+    int total_frames = video_stream->nb_frames;
+    int width = video_stream->codecpar->width;
+    int height = video_stream->codecpar->height;
+    
+    printf("\n📹 Video: stream %d, %dx%d, %.2f fps, %d frames\n", 
+           video_stream_idx, width, height, fps, total_frames);
+    
+    // ===== FIX FOR VIDEOS WITH NO FRAME COUNT =====
+    if (total_frames <= 0) {
+        printf("\n⚠️  Warning: Video has no frame count in header\n");
+        
+        double duration = 0;
+        if (fmt_ctx->duration > 0) {
+            duration = fmt_ctx->duration / (double)AV_TIME_BASE;
+        }
+        if (duration <= 0 && video_stream->duration > 0) {
+            duration = video_stream->duration * av_q2d(video_stream->time_base);
+        }
+        
+        if (duration > 0) {
+            double exact_frames = duration * fps;
+            total_frames = (int)ceil(exact_frames);
+            printf("   Duration: %.3f seconds\n", duration);
+            printf("   Calculated frames: %.3f → %d frames\n", exact_frames, total_frames);
+        } else {
+            printf("❌ Cannot determine video duration!\n");
+            return 1;
+        }
+    }
+    
+    int start_frame = 0, end_frame = total_frames - 1;
+    
+    if (config.use_time) {
+        start_frame = parse_time_to_frame(config.time_str, fps);
+        end_frame = start_frame;
+        printf("\n⏱️ Time %s = frame %d\n", config.time_str, start_frame);
+    } else if (config.use_time_range) {
+        start_frame = parse_time_to_frame(config.start_time, fps);
+        end_frame = parse_time_to_frame(config.end_time, fps);
+        printf("\n⏱️ Time range %s to %s = frames %d to %d\n", 
+               config.start_time, config.end_time, start_frame, end_frame);
+    } else if (config.start_frame > 0 || config.end_frame > 0) {
+        if (config.start_frame > 0) start_frame = config.start_frame;
+        if (config.end_frame > 0) end_frame = config.end_frame;
+        printf("\n📹 Frame range: %d to %d\n", start_frame, end_frame);
+    }
+    
+    if (start_frame < 0) start_frame = 0;
+    if (end_frame >= total_frames) end_frame = total_frames - 1;
+    
+    int frames_to_extract[4096];
+    int extract_count = 0;
+    
+    if (config.frame_count > 0) {
+        for (int i = 0; i < config.frame_count; i++) {
+            if (config.frames[i] >= start_frame && config.frames[i] <= end_frame) {
+                frames_to_extract[extract_count++] = config.frames[i];
+            }
+        }
+        printf("📋 Extracting %d specific frames\n", extract_count);
+    } else {
+        for (int f = start_frame; f <= end_frame; f += config.step) {
+            frames_to_extract[extract_count++] = f;
+        }
+        printf("📋 Extracting %d frames (range %d-%d, step %d)\n", 
+               extract_count, start_frame, end_frame, config.step);
+    }
+    
+    if (extract_count == 0) {
+        printf("❌ No frames to extract!\n");
+        return 1;
+    }
+    
+    const AVCodec* codec = avcodec_find_decoder(video_stream->codecpar->codec_id);
+    AVCodecContext* codec_ctx = avcodec_alloc_context3(codec);
+    avcodec_parameters_to_context(codec_ctx, video_stream->codecpar);
+    
+    if (avcodec_open2(codec_ctx, codec, NULL) < 0) {
+        printf("❌ Failed to open video codec\n");
+        return 1;
+    }
+    
+    AVFrame* frame = av_frame_alloc();
+    
+    if (start_frame > 0) {
+        int64_t seek_pts = av_rescale_q(start_frame, 
+                                        (AVRational){1, (int)fps},
+                                        video_stream->time_base);
+        av_seek_frame(fmt_ctx, video_stream_idx, seek_pts, AVSEEK_FLAG_BACKWARD);
+    }
+    
+    FrameQueue frame_queue;
+    queue_init(&frame_queue, width, height, config.format, config.fast_mode, 
+               config.output_pattern, extract_count);
+    
+    ProgressTracker progress;
+    progress_init(&progress, extract_count);
+    
+    pthread_t saver_threads[NUM_SAVER_THREADS];
+    SaverThreadArgs thread_args[NUM_SAVER_THREADS];
+    
+    for (int i = 0; i < NUM_SAVER_THREADS; i++) {
+        thread_args[i].queue = &frame_queue;
+        thread_args[i].progress = &progress;
+        pthread_create(&saver_threads[i], NULL, frame_saver_thread, &thread_args[i]);
+    }
+    
+    pthread_t audio_thread;
+    if (config.extract_audio) {
+        pthread_create(&audio_thread, NULL, extract_audio_thread, &config);
+    }
+    
+    printf("\n🔄 Decoding frames with %d saver threads...\n", NUM_SAVER_THREADS);
+    
+    AVPacket packet;
+    int current_frame = 0;
+    int frames_queued = 0;
+    int frames_decoded = 0;
+    
+    while (av_read_frame(fmt_ctx, &packet) >= 0 && frames_queued < extract_count) {
+        if (packet.stream_index == video_stream_idx) {
+            avcodec_send_packet(codec_ctx, &packet);
+            
+            while (avcodec_receive_frame(codec_ctx, frame) == 0) {
+                if (current_frame >= start_frame && 
+                    current_frame <= end_frame &&
+                    (config.frame_count == 0 || 
+                     frame_in_list(current_frame, frames_to_extract, extract_count))) {
+                    
+                    queue_push(&frame_queue, frame, current_frame);
+                    frames_queued++;
+                    frames_decoded++;
+                    
+                    if (frames_decoded % 10 == 0) {
+                        printf("\r📽️ Decoded: %d/%d frames", frames_decoded, extract_count);
+                        fflush(stdout);
+                    }
+                }
+                current_frame++;
+                
+                if (frames_queued >= extract_count) break;
+            }
+        }
+        av_packet_unref(&packet);
+        
+        if (frames_queued >= extract_count) break;
+    }
+    
+    printf("\r📽️ Decoded: %d/%d frames - done!\n", frames_decoded, extract_count);
+    
+    queue_set_done(&frame_queue);
+    
+    for (int i = 0; i < NUM_SAVER_THREADS; i++) {
+        pthread_join(saver_threads[i], NULL);
+    }
+    
+    if (config.extract_audio) {
+        pthread_join(audio_thread, NULL);
+    }
+    
+    progress_finish(&progress);
+    
+    av_frame_free(&frame);
+    avcodec_free_context(&codec_ctx);
+    avformat_close_input(&fmt_ctx);
+    queue_destroy(&frame_queue);
+    
+    printf("\n✅ Done! Extracted %d frames using %d threads!\n", 
+           extract_count, NUM_SAVER_THREADS);
+    
+    // Clean up downloaded file if from YouTube
+    if (config.ytdl_download) {
+        printf("\n🧹 Cleaning up downloaded file...\n");
+        char rm_cmd[512];
+        snprintf(rm_cmd, sizeof(rm_cmd), "rm -f \"%s\"", config.input);
+        system(rm_cmd);
+    }
+    
+    return 0;
+}
