@@ -607,22 +607,6 @@ int download_from_youtube(Config* config) {
     // Remove newline from temporary buffer
     downloaded_filename[strcspn(downloaded_filename, "\n")] = '\0';
     
-    // ===== ESCAPE THE FILENAME =====
-    char* escaped_filename = malloc(strlen(downloaded_filename) * 2 + 1);
-    int j = 0;
-    for (int i = 0; downloaded_filename[i]; i++) {
-        if (downloaded_filename[i] == ' ' || downloaded_filename[i] == '(' || 
-            downloaded_filename[i] == ')' || downloaded_filename[i] == '\'') {
-            escaped_filename[j++] = '\\';
-        }
-        escaped_filename[j++] = downloaded_filename[i];
-    }
-    escaped_filename[j] = '\0';
-    
-    // Copy the escaped filename to config->input
-    strcpy(config->input, escaped_filename);
-    free(escaped_filename);
-    
     printf("📂 Downloaded: %s\n", config->input);
     return 1;
 }
